@@ -1,0 +1,1207 @@
+#!/usr/bin/env python3
+r"""
+CrosshairX —— 精确绿色十字准星覆盖层
+========================================
+- 小窗口 + 每像素 Alpha → 宽度以真实物理像素计量
+- tkinter 控制面板：开关热键、调粗细/颜色/不透明度
+- M / 1-9 切换显示器
+
+用法:
+    python CrosshairX                    覆盖模式 + 控制面板
+    python CrosshairX -m 2 -x 5 -y -3    命令行参数启动
+    python CrosshairX inject <进程名>     注入模式 (独占全屏)
+    python CrosshairX build-dll          编译 DLL
+"""
+
+import ctypes
+from ctypes import wintypes, POINTER, Structure, c_void_p, byref, sizeof, cast, WINFUNCTYPE
+import sys
+import os
+import argparse
+
+# ── DPI ──────────────────────────────────────────────────────────
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+# ── Win32 API ────────────────────────────────────────────────────
+user32   = ctypes.windll.user32
+gdi32    = ctypes.windll.gdi32
+kernel32 = ctypes.windll.kernel32
+
+# ── 常量 ─────────────────────────────────────────────────────────
+WS_EX_LAYERED    = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOPMOST    = 0x00000008
+WS_EX_NOACTIVATE = 0x08000000
+WS_EX_TOOLWINDOW = 0x00000080
+WS_POPUP         = 0x80000000
+
+ULW_ALPHA      = 0x00000002
+AC_SRC_OVER    = 0x00
+AC_SRC_ALPHA   = 0x01
+
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+SWP_NOMOVE     = 0x0002
+SWP_NOSIZE     = 0x0001
+HWND_TOPMOST   = -1
+SW_SHOWNOACTIVATE = 4
+
+WM_DESTROY       = 0x0002
+WM_TIMER         = 0x0113
+WM_DISPLAYCHANGE = 0x007E
+WH_KEYBOARD_LL   = 13
+WM_KEYDOWN       = 0x0100
+WM_SYSKEYDOWN    = 0x0104
+
+VK_LEFT = 0x25; VK_UP = 0x26; VK_RIGHT = 0x27; VK_DOWN = 0x28
+VK_R = 0x52; VK_M = 0x4D; VK_SHIFT = 0x10
+VK_0 = 0x30; VK_1 = 0x31; VK_2 = 0x32; VK_3 = 0x33; VK_4 = 0x34
+VK_5 = 0x35; VK_6 = 0x36; VK_7 = 0x37; VK_8 = 0x38; VK_9 = 0x39
+VK_CTRL  = 0x11
+VK_MENU  = 0x12  # Alt
+
+DIB_RGB_COLORS = 0; NULL_BRUSH = 5
+
+# ── 结构体 ───────────────────────────────────────────────────────
+class POINT(Structure):
+    _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+class SIZE(Structure):
+    _fields_ = [('cx', ctypes.c_long), ('cy', ctypes.c_long)]
+class MSG(Structure):
+    _fields_ = [('hwnd', wintypes.HWND), ('message', wintypes.UINT),
+                ('wParam', wintypes.WPARAM), ('lParam', wintypes.LPARAM),
+                ('time', wintypes.DWORD), ('pt', POINT)]
+class RECT(Structure):
+    _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
+                ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+class MONITORINFOEX(Structure):
+    _fields_ = [('cbSize', wintypes.DWORD), ('rcMonitor', RECT),
+                ('rcWork', RECT), ('dwFlags', wintypes.DWORD),
+                ('szDevice', ctypes.c_wchar * 32)]
+class WNDCLASSEX(Structure):
+    _fields_ = [('cbSize', wintypes.UINT), ('style', wintypes.UINT),
+                ('lpfnWndProc', c_void_p), ('cbClsExtra', ctypes.c_int),
+                ('cbWndExtra', ctypes.c_int), ('hInstance', wintypes.HINSTANCE),
+                ('hIcon', wintypes.HANDLE), ('hCursor', wintypes.HANDLE),
+                ('hbrBackground', wintypes.HBRUSH), ('lpszMenuName', ctypes.c_wchar_p),
+                ('lpszClassName', ctypes.c_wchar_p), ('hIconSm', wintypes.HANDLE)]
+class BITMAPINFOHEADER(Structure):
+    _fields_ = [('biSize', wintypes.DWORD), ('biWidth', wintypes.LONG),
+                ('biHeight', wintypes.LONG), ('biPlanes', wintypes.WORD),
+                ('biBitCount', wintypes.WORD), ('biCompression', wintypes.DWORD),
+                ('biSizeImage', wintypes.DWORD), ('biXPelsPerMeter', wintypes.LONG),
+                ('biYPelsPerMeter', wintypes.LONG), ('biClrUsed', wintypes.DWORD),
+                ('biClrImportant', wintypes.DWORD)]
+class BITMAPINFO(Structure):
+    _fields_ = [('bmiHeader', BITMAPINFOHEADER)]
+class BLENDFUNCTION(Structure):
+    _fields_ = [('BlendOp', wintypes.BYTE), ('BlendFlags', wintypes.BYTE),
+                ('SourceConstantAlpha', wintypes.BYTE), ('AlphaFormat', wintypes.BYTE)]
+class KBDLLHOOKSTRUCT(Structure):
+    _fields_ = [('vkCode', wintypes.DWORD), ('scanCode', wintypes.DWORD),
+                ('flags', wintypes.DWORD), ('time', wintypes.DWORD),
+                ('dwExtraInfo', POINTER(ctypes.c_ulong))]
+
+# ── argtypes ─────────────────────────────────────────────────────
+user32.DefWindowProcW.argtypes   = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.DefWindowProcW.restype    = ctypes.c_longlong
+user32.SetWindowPos.argtypes     = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+user32.ShowWindow.argtypes       = [wintypes.HWND, ctypes.c_int]
+user32.DestroyWindow.argtypes    = [wintypes.HWND]
+user32.PostQuitMessage.argtypes  = [ctypes.c_int]
+user32.SetTimer.argtypes         = [wintypes.HWND, ctypes.c_ulonglong, wintypes.UINT, c_void_p]
+user32.RegisterClassExW.argtypes = [POINTER(WNDCLASSEX)]
+user32.CreateWindowExW.argtypes  = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+user32.EnumDisplayMonitors.argtypes = [wintypes.HDC, POINTER(RECT), c_void_p, wintypes.LPARAM]
+user32.GetMonitorInfoW.argtypes  = [wintypes.HMONITOR, POINTER(MONITORINFOEX)]
+user32.GetMessageW.argtypes      = [POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+user32.TranslateMessage.argtypes = [POINTER(MSG)]
+user32.DispatchMessageW.argtypes = [POINTER(MSG)]
+user32.UpdateLayeredWindow.argtypes = [wintypes.HWND, wintypes.HDC, POINTER(POINT), POINTER(SIZE), wintypes.HDC, POINTER(POINT), wintypes.COLORREF, POINTER(BLENDFUNCTION), wintypes.DWORD]
+user32.GetDC.argtypes            = [wintypes.HWND]
+user32.ReleaseDC.argtypes        = [wintypes.HWND, wintypes.HDC]
+user32.SetWindowsHookExW.argtypes = [ctypes.c_int, c_void_p, wintypes.HINSTANCE, wintypes.DWORD]
+user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+user32.CallNextHookEx.argtypes   = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+user32.CallNextHookEx.restype    = ctypes.c_longlong
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.PostMessageW.argtypes     = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.GetPhysicalCursorPos.argtypes = [POINTER(POINT)]
+# unused: SetPhysicalCursorPos, MoveWindow
+
+gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+gdi32.DeleteDC.argtypes          = [wintypes.HDC]
+gdi32.CreateDIBSection.argtypes  = [wintypes.HDC, POINTER(BITMAPINFO), wintypes.UINT, POINTER(c_void_p), wintypes.HANDLE, wintypes.DWORD]
+gdi32.SelectObject.argtypes      = [wintypes.HDC, wintypes.HGDIOBJ]
+gdi32.DeleteObject.argtypes      = [wintypes.HGDIOBJ]
+gdi32.GetStockObject.argtypes    = [ctypes.c_int]
+
+kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+
+_hinstance = kernel32.GetModuleHandleW(None)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CrosshairOverlay —— 精确像素十字准星
+# ══════════════════════════════════════════════════════════════════
+
+class CrosshairOverlay:
+    """
+    小窗口精确像素准星覆盖层。
+
+    关键: 窗口只覆盖准星周围的小区域 (如 40×40px)，DIB 中的每个
+    像素直接对应屏幕物理像素，不受显示器 DPI 缩放影响。
+    """
+
+    def __init__(self):
+        # ── 准星参数 ──
+        self.radius  = 6    # 十字单臂长度 (px)
+        self.thickness = 2  # 线宽 (px) — 精确物理像素
+        self.r = 0; self.g = 255; self.b = 0; self.a = 230
+
+        # ── 位置 ──
+        self.offset_x = 0
+        self.offset_y = 0
+        self.monitor_idx = 0
+        self.monitors = []
+
+        # ── 内部状态 ──
+        self.hwnd       = None
+        self.hook_id    = None
+        self.running    = False
+        self.hotkeys_enabled = True  # 控制面板可禁用
+
+        # ── 渲染 ──
+        self._mem_dc   = None
+        self._dib_bmp  = None
+        self._old_bmp  = None
+        self._pBits    = None
+        self._dib_size = 0   # 当前 DIB 边长
+        self._last_pos = (-9999, -9999)  # 上次渲染位置
+
+    # ── 显示器 ──────────────────────────────────────────────────
+    def enum_monitors(self):
+        self.monitors = []
+
+        @WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC, POINTER(RECT), wintypes.LPARAM)
+        def cb(hMon, hdc, rc, dw):
+            mi = MONITORINFOEX()
+            mi.cbSize = sizeof(MONITORINFOEX)
+            if user32.GetMonitorInfoW(hMon, byref(mi)):
+                self.monitors.append({
+                    'rect': mi.rcMonitor, 'work': mi.rcWork,
+                    'primary': bool(mi.dwFlags & 1), 'device': mi.szDevice,
+                })
+            return True
+
+        user32.EnumDisplayMonitors(None, None, cb, 0)
+        self.monitors.sort(key=lambda m: not m['primary'])
+
+    def monitor_rect(self):
+        idx = max(0, min(self.monitor_idx, len(self.monitors) - 1))
+        return self.monitors[idx]['rect']
+
+    def monitor_center(self):
+        r = self.monitor_rect()
+        return (r.left + r.right) // 2, (r.top + r.bottom) // 2
+
+    def num_monitors(self):
+        return len(self.monitors)
+
+    # ── 计算需要的最小窗口尺寸 ─────────────────────────────────
+    def _required_size(self):
+        """返回能容纳准星的最小窗口边长（偶数，对齐像素）"""
+        # 准星总宽度/高度 = radius*2 + thickness，加少量 padding
+        needed = max(self.radius * 2 + self.thickness, self.thickness * 2 + self.radius * 2)
+        needed += 4  # 每边 2px padding
+        # 对齐到 2 的倍数（确保中心对齐）
+        return max(8, (needed + 1) // 2 * 2)
+
+    # ── 颜色 ─────────────────────────────────────────────────────
+    @property
+    def _bgra(self):
+        return ((self.a << 24) | (self.r << 16) | (self.g << 8) | self.b)
+
+    # ── 渲染引擎 ────────────────────────────────────────────────
+    def _ensure_dib(self, new_size):
+        """确保 DIB 缓冲区存在且尺寸正确。"""
+        if new_size == self._dib_size and self._pBits:
+            return
+
+        if self._dib_bmp:
+            if self._old_bmp:
+                gdi32.SelectObject(self._mem_dc, self._old_bmp)
+                self._old_bmp = None
+            gdi32.DeleteObject(self._dib_bmp)
+            self._dib_bmp = None
+
+        if not self._mem_dc:
+            dc = user32.GetDC(None)
+            self._mem_dc = gdi32.CreateCompatibleDC(dc)
+            user32.ReleaseDC(None, dc)
+
+        w = h = new_size
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth  = w
+        bmi.bmiHeader.biHeight = -h
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0
+
+        pv = c_void_p()
+        self._dib_bmp = gdi32.CreateDIBSection(self._mem_dc, byref(bmi),
+                                                DIB_RGB_COLORS, byref(pv), None, 0)
+        self._old_bmp = gdi32.SelectObject(self._mem_dc, self._dib_bmp)
+        self._pBits = pv
+        self._dib_size = new_size
+        self._last_pos = (-9999, -9999)
+
+    def _paint(self):
+        """在 DIB 缓冲区中直接写像素绘制准星。每个像素都是精确的。"""
+        size = self._dib_size
+        pixels = ctypes.cast(self._pBits, POINTER(ctypes.c_uint32))
+        total = size * size
+
+        # 全透明
+        ctypes.memset(self._pBits, 0, total * 4)
+
+        color = self._bgra
+        cx = size // 2  # 窗口中心 X
+        cy = size // 2  # 窗口中心 Y
+
+        # ── 水平线 ──
+        # 厚度从 cy 向上 spread
+        top    = cy - self.thickness // 2
+        bottom = top + self.thickness
+        left   = cx - self.radius
+        right  = cx + self.radius
+        for row in range(max(0, top), min(size, bottom)):
+            base = row * size
+            for col in range(max(0, left), min(size, right + 1)):
+                pixels[base + col] = color
+
+        # ── 垂直线 ──
+        top    = cy - self.radius
+        bottom = cy + self.radius
+        left   = cx - self.thickness // 2
+        right  = left + self.thickness
+        for row in range(max(0, top), min(size, bottom + 1)):
+            base = row * size
+            for col in range(max(0, left), min(size, right)):
+                pixels[base + col] = color
+
+    def update_overlay(self):
+        """渲染并更新窗口。（小窗口方案）"""
+        center_x, center_y = self.monitor_center()
+        target_x = center_x + self.offset_x
+        target_y = center_y + self.offset_y
+
+        # 确定需要的 DIB 尺寸
+        sz = self._required_size()
+        self._ensure_dib(sz)
+
+        # 位置变了才重绘
+        if (target_x, target_y) == self._last_pos and self._dib_size == sz:
+            return
+
+        self._paint()
+
+        # 窗口左上角
+        win_x = target_x - sz // 2
+        win_y = target_y - sz // 2
+
+        # UpdateLayeredWindow：小窗口，每个 DIB 像素 = 1 屏幕物理像素
+        ptDest = POINT(win_x, win_y)
+        szWnd  = SIZE(sz, sz)
+        ptSrc  = POINT(0, 0)
+        blend  = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
+
+        screen_dc = user32.GetDC(None)
+        user32.UpdateLayeredWindow(self.hwnd, screen_dc, byref(ptDest), byref(szWnd),
+                                    self._mem_dc, byref(ptSrc), 0, byref(blend), ULW_ALPHA)
+        user32.ReleaseDC(None, screen_dc)
+
+        # 置顶
+        user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+
+        self._last_pos = (target_x, target_y)
+
+    def destroy_render(self):
+        if self._mem_dc:
+            if self._old_bmp:
+                gdi32.SelectObject(self._mem_dc, self._old_bmp)
+                self._old_bmp = None
+            if self._dib_bmp:
+                gdi32.DeleteObject(self._dib_bmp)
+                self._dib_bmp = None
+            gdi32.DeleteDC(self._mem_dc)
+            self._mem_dc = None
+        self._pBits = None
+
+    # ── 窗口 ────────────────────────────────────────────────────
+    _cls_cb = None
+
+    def create_window(self):
+        """创建小覆盖窗口。"""
+        cls = "CrosshairX_SmallOverlay"
+        sz = self._required_size()
+
+        # 窗口过程
+        def wnd_proc(hwnd, msg, wParam, lParam):
+            if msg == WM_TIMER:
+                self.update_overlay()
+                return 0
+            elif msg == WM_DISPLAYCHANGE:
+                self.enum_monitors()
+                return 0
+            elif msg == WM_DESTROY:
+                self.running = False
+                user32.KillTimer(hwnd, 100)
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, msg, wParam, lParam)
+
+        CrosshairOverlay._cls_cb = WINFUNCTYPE(ctypes.c_longlong, wintypes.HWND, wintypes.UINT,
+                                                ctypes.c_ulonglong, ctypes.c_ulonglong)(wnd_proc)
+
+        wc = WNDCLASSEX()
+        wc.cbSize = sizeof(WNDCLASSEX)
+        wc.lpfnWndProc   = cast(CrosshairOverlay._cls_cb, c_void_p)
+        wc.hInstance     = _hinstance
+        wc.hbrBackground = gdi32.GetStockObject(NULL_BRUSH)
+        wc.lpszClassName = cls
+
+        if not user32.RegisterClassExW(byref(wc)):
+            raise RuntimeError(f"RegisterClassEx 失败: {kernel32.GetLastError()}")
+
+        cx, cy = self.monitor_center()
+        x = cx - sz // 2
+        y = cy - sz // 2
+
+        ex_style = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+        self.hwnd = user32.CreateWindowExW(ex_style, cls, "CrosshairX", WS_POPUP,
+                                            x, y, sz, sz, None, None, _hinstance, None)
+        if not self.hwnd:
+            raise RuntimeError(f"CreateWindowEx 失败: {kernel32.GetLastError()}")
+
+        user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
+        self.update_overlay()
+        user32.SetTimer(self.hwnd, 100, 16, None)  # ~60fps
+        self.running = True
+
+    # ── 键盘 Hook ───────────────────────────────────────────────
+    _instance = None
+
+    def _on_key(self, vk):
+        if not self.hotkeys_enabled:
+            return
+        shift = (user32.GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0
+        step  = 10 if shift else 1
+        changed = False
+
+        if   vk == VK_LEFT:   self.offset_x -= step; changed = True
+        elif vk == VK_RIGHT:  self.offset_x += step; changed = True
+        elif vk == VK_UP:     self.offset_y -= step; changed = True
+        elif vk == VK_DOWN:   self.offset_y += step; changed = True
+        elif vk == VK_R:
+            self.offset_x = 0; self.offset_y = 0; changed = True
+        elif vk == VK_M and len(self.monitors) > 1:
+            self.monitor_idx = (self.monitor_idx + 1) % len(self.monitors)
+            self.offset_x = 0; self.offset_y = 0
+            r = self.monitor_rect()
+            w, h = r.right - r.left, r.bottom - r.top
+            print(f"  → 显示器 [{self.monitor_idx + 1}] {w}x{h}")
+        elif vk in (VK_1, VK_2, VK_3, VK_4, VK_5, VK_6, VK_7, VK_8, VK_9):
+            idx = vk - VK_1
+            if idx < len(self.monitors) and idx != self.monitor_idx:
+                self.monitor_idx = idx
+                self.offset_x = 0; self.offset_y = 0
+                r = self.monitor_rect()
+                w, h = r.right - r.left, r.bottom - r.top
+                print(f"  → 显示器 [{self.monitor_idx + 1}] {w}x{h}")
+
+        if changed:
+            self._last_pos = (-9999, -9999)  # 强制重绘
+            print(f"  偏移: ({self.offset_x:+d}, {self.offset_y:+d})")
+
+    def install_hook(self):
+        CrosshairOverlay._instance = self
+        HK = WINFUNCTYPE(ctypes.c_longlong, ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong)
+
+        def _hk(nCode, wParam, lParam):
+            if nCode >= 0 and (wParam == WM_KEYDOWN or wParam == WM_SYSKEYDOWN):
+                kb = cast(lParam, POINTER(KBDLLHOOKSTRUCT)).contents
+                inst = CrosshairOverlay._instance
+                if inst:
+                    inst._on_key(kb.vkCode)
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+        self._hk_cb = HK(_hk)
+        self.hook_id = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._hk_cb, None, 0)
+        if not self.hook_id:
+            raise RuntimeError(f"SetWindowsHookEx 失败: {kernel32.GetLastError()}")
+
+    def uninstall_hook(self):
+        if self.hook_id:
+            user32.UnhookWindowsHookEx(self.hook_id)
+            self.hook_id = None
+        CrosshairOverlay._instance = None
+
+    # ── 消息循环 ────────────────────────────────────────────────
+    def pump_messages(self):
+        """非阻塞消息处理（用于与 tkinter 共存）"""
+        msg = MSG()
+        while user32.PeekMessageW(byref(msg), None, 0, 0, 1):  # PM_REMOVE
+            if msg.message == WM_DESTROY:
+                self.running = False
+                user32.PostQuitMessage(0)
+                return False
+            user32.TranslateMessage(byref(msg))
+            user32.DispatchMessageW(byref(msg))
+        return self.running
+
+    def shutdown(self):
+        self.uninstall_hook()
+        self.destroy_render()
+        if self.hwnd:
+            user32.DestroyWindow(self.hwnd)
+            self.hwnd = None
+
+
+# ══════════════════════════════════════════════════════════════════
+#  控制面板 (tkinter)
+# ══════════════════════════════════════════════════════════════════
+
+class ControlPanel:
+    """tkinter 控制面板。在独立线程中运行。"""
+
+    def __init__(self, overlay):
+        self.overlay = overlay
+        self.root    = None
+        self._vars   = {}
+        self._widget_map = {}
+
+    def start(self):
+        """在主线程中启动 tkinter 主循环。"""
+        import tkinter as tk
+        from tkinter import ttk
+
+        self.root = tk.Tk()
+        self.root.title("CrosshairX — 控制面板")
+        self.root.resizable(False, False)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # 置顶
+        self.root.attributes('-topmost', True)
+
+        pad = {'padx': 8, 'pady': 4}
+        row = 0
+
+        # ── 准星显示开关 ──
+        self._vars['visible'] = tk.BooleanVar(value=True)
+        cb = ttk.Checkbutton(self.root, text="显示准星", variable=self._vars['visible'],
+                             command=self._on_visible)
+        cb.grid(row=row, column=0, columnspan=3, sticky='w', **pad)
+        row += 1
+
+        # ── 热键开关 ──
+        self._vars['hotkeys'] = tk.BooleanVar(value=True)
+        cb = ttk.Checkbutton(self.root, text="启用方向键调整", variable=self._vars['hotkeys'],
+                             command=self._on_hotkeys)
+        cb.grid(row=row, column=0, columnspan=3, sticky='w', **pad)
+        row += 1
+
+        ttk.Separator(self.root, orient='horizontal').grid(
+            row=row, column=0, columnspan=3, sticky='ew', **pad)
+        row += 1
+
+        # ── 显示器选择 ──
+        ttk.Label(self.root, text="显示器:").grid(row=row, column=0, sticky='w', **pad)
+        n = self.overlay.num_monitors()
+        self._vars['monitor'] = tk.StringVar(value=str(self.overlay.monitor_idx + 1))
+        monitor_options = [str(i + 1) for i in range(n)]
+        cb = ttk.Combobox(self.root, textvariable=self._vars['monitor'],
+                          values=monitor_options, state='readonly', width=4)
+        cb.grid(row=row, column=1, sticky='w', **pad)
+        cb.bind('<<ComboboxSelected>>', self._on_monitor)
+        row += 1
+
+        # ── 半径 ──
+        ttk.Label(self.root, text="准星半径:").grid(row=row, column=0, sticky='w', **pad)
+        self._vars['radius'] = tk.IntVar(value=self.overlay.radius)
+        ttk.Spinbox(self.root, from_=2, to=100, textvariable=self._vars['radius'],
+                    width=5, command=self._on_radius).grid(row=row, column=1, sticky='w', **pad)
+        ttk.Label(self.root, text="px").grid(row=row, column=2, sticky='w', **pad)
+        row += 1
+
+        # ── 线宽 (像素精确) ──
+        ttk.Label(self.root, text="线宽:").grid(row=row, column=0, sticky='w', **pad)
+        self._vars['thickness'] = tk.IntVar(value=self.overlay.thickness)
+        ttk.Spinbox(self.root, from_=1, to=30, textvariable=self._vars['thickness'],
+                    width=5, command=self._on_thickness).grid(row=row, column=1, sticky='w', **pad)
+        ttk.Label(self.root, text="px  (物理像素)").grid(row=row, column=2, sticky='w', **pad)
+        row += 1
+
+        ttk.Separator(self.root, orient='horizontal').grid(
+            row=row, column=0, columnspan=3, sticky='ew', **pad)
+        row += 1
+
+        # ── 颜色 ──
+        ttk.Label(self.root, text="颜色:").grid(row=row, column=0, sticky='w', **pad)
+
+        color_frame = ttk.Frame(self.root)
+        color_frame.grid(row=row, column=1, columnspan=2, sticky='w', **pad)
+        row += 1
+
+        for i, (label, attr, max_val) in enumerate([
+            ('R', 'r', 255), ('G', 'g', 255), ('B', 'b', 255), ('A', 'a', 255),
+        ]):
+            ttk.Label(color_frame, text=label).grid(row=i, column=0, sticky='e', **pad)
+            self._vars[attr] = tk.IntVar(value=getattr(self.overlay, attr))
+            ttk.Scale(color_frame, from_=0, to=max_val, orient='horizontal',
+                      variable=self._vars[attr], length=150,
+                      command=lambda v, a=attr: self._on_color(a, v)).grid(
+                row=i, column=1, sticky='ew', **pad)
+            self._vars[f'{attr}_lbl'] = tk.StringVar(value=str(getattr(self.overlay, attr)))
+            ttk.Label(color_frame, textvariable=self._vars[f'{attr}_lbl'], width=3).grid(
+                row=i, column=2, sticky='w', **pad)
+
+        # 颜色预览
+        self._color_preview = tk.Canvas(color_frame, width=60, height=24,
+                                         bg=self._hex_color(), highlightthickness=1,
+                                         highlightbackground='#666')
+        self._color_preview.grid(row=4, column=0, columnspan=3, pady=4)
+
+        row += 1
+        ttk.Separator(self.root, orient='horizontal').grid(
+            row=row, column=0, columnspan=3, sticky='ew', **pad)
+        row += 1
+
+        # ── 偏移 ──
+        ttk.Label(self.root, text="X 偏移:").grid(row=row, column=0, sticky='w', **pad)
+        self._vars['offset_x'] = tk.IntVar(value=self.overlay.offset_x)
+        ttk.Spinbox(self.root, from_=-2000, to=2000, textvariable=self._vars['offset_x'],
+                    width=6, command=self._on_offset).grid(row=row, column=1, sticky='w', **pad)
+        ttk.Label(self.root, text="px").grid(row=row, column=2, sticky='w', **pad)
+        row += 1
+
+        ttk.Label(self.root, text="Y 偏移:").grid(row=row, column=0, sticky='w', **pad)
+        self._vars['offset_y'] = tk.IntVar(value=self.overlay.offset_y)
+        ttk.Spinbox(self.root, from_=-2000, to=2000, textvariable=self._vars['offset_y'],
+                    width=6, command=self._on_offset).grid(row=row, column=1, sticky='w', **pad)
+        ttk.Label(self.root, text="px").grid(row=row, column=2, sticky='w', **pad)
+        row += 1
+
+        # ── 按钮 ──
+        btn_frame = ttk.Frame(self.root)
+        btn_frame.grid(row=row, column=0, columnspan=3, pady=10)
+        ttk.Button(btn_frame, text="复位偏移", command=self._on_reset).pack(side='left', padx=4)
+        ttk.Button(btn_frame, text="退出", command=self._on_close).pack(side='left', padx=4)
+
+        row += 1
+
+        # ── 状态栏 ──
+        self._vars['status'] = tk.StringVar(value="准星运行中")
+        ttk.Label(self.root, textvariable=self._vars['status'],
+                  foreground='#666').grid(row=row, column=0, columnspan=3, **pad)
+
+        self.root.geometry("+%d+%d" % (50, 100))
+
+        # 定时器：与 overlay 消息泵同步
+        self._poll_overlay()
+
+        self.root.mainloop()
+
+    def _poll_overlay(self):
+        """定期处理 overlay 消息，保持窗口响应。"""
+        if self.overlay.running:
+            alive = self.overlay.pump_messages()
+            if not alive:
+                self.root.destroy()
+                return
+            self.root.after(20, self._poll_overlay)
+        else:
+            self.root.destroy()
+
+    def _hex_color(self):
+        return f'#{self.overlay.r:02x}{self.overlay.g:02x}{self.overlay.b:02x}'
+
+    def _apply_all(self):
+        """将所有设置同步到 overlay。"""
+        o = self.overlay
+        o.hotkeys_enabled = self._vars['hotkeys'].get()
+        # 显示器
+        idx = int(self._vars['monitor'].get()) - 1
+        if idx != o.monitor_idx and 0 <= idx < len(o.monitors):
+            o.monitor_idx = idx
+            o.offset_x = 0
+            o.offset_y = 0
+            self._vars['offset_x'].set(0)
+            self._vars['offset_y'].set(0)
+        # 外观
+        o.radius    = self._vars['radius'].get()
+        o.thickness = self._vars['thickness'].get()
+        o.r = self._vars['r'].get()
+        o.g = self._vars['g'].get()
+        o.b = self._vars['b'].get()
+        o.a = self._vars['a'].get()
+        # 偏移
+        o.offset_x = self._vars['offset_x'].get()
+        o.offset_y = self._vars['offset_y'].get()
+        # 强制重绘
+        o._last_pos = (-9999, -9999)
+        # 可见性
+        if self._vars['visible'].get() and o.hwnd:
+            user32.ShowWindow(o.hwnd, SW_SHOWNOACTIVATE)
+        elif not self._vars['visible'].get() and o.hwnd:
+            user32.ShowWindow(o.hwnd, 0)  # SW_HIDE
+
+    # ── 事件处理 ──
+    def _on_visible(self):
+        self._apply_all()
+        s = "准星运行中" if self._vars['visible'].get() else "准星已隐藏"
+        self._vars['status'].set(s)
+
+    def _on_hotkeys(self):
+        self.overlay.hotkeys_enabled = self._vars['hotkeys'].get()
+        s = "热键已启用" if self._vars['hotkeys'].get() else "热键已禁用"
+        self._vars['status'].set(s)
+
+    def _on_monitor(self, _e=None):
+        self._apply_all()
+        r = self.overlay.monitor_rect()
+        w, h = r.right - r.left, r.bottom - r.top
+        self._vars['status'].set(f"→ 显示器 [{self.overlay.monitor_idx + 1}] {w}x{h}")
+
+    def _on_radius(self):
+        self._apply_all()
+
+    def _on_thickness(self):
+        self._apply_all()
+
+    def _on_color(self, attr, val):
+        v = int(float(val))
+        self._vars[attr].set(v)
+        self._vars[f'{attr}_lbl'].set(str(v))
+        self._apply_all()
+        self._color_preview.configure(bg=self._hex_color())
+
+    def _on_offset(self):
+        self._apply_all()
+
+    def _on_reset(self):
+        self._vars['offset_x'].set(0)
+        self._vars['offset_y'].set(0)
+        self._vars['radius'].set(6)
+        self._vars['thickness'].set(2)
+        self._vars['r'].set(0)
+        self._vars['g'].set(255)
+        self._vars['b'].set(0)
+        self._vars['a'].set(230)
+        for attr in ['r', 'g', 'b', 'a']:
+            self._vars[f'{attr}_lbl'].set(str(self._vars[attr].get()))
+        self.overlay.monitor_idx = 0
+        self._vars['monitor'].set('1')
+        self.overlay.offset_x = 0
+        self.overlay.offset_y = 0
+        self._apply_all()
+        self._color_preview.configure(bg=self._hex_color())
+        self._vars['status'].set("已复位")
+
+    def _on_close(self):
+        self.overlay.running = False
+        if self.overlay.hwnd:
+            user32.PostMessageW(self.overlay.hwnd, WM_DESTROY, 0, 0)
+        self.root.destroy()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  命令行覆盖模式
+# ══════════════════════════════════════════════════════════════════
+
+def run_overlay_cli(args):
+    """无 GUI 的纯命令行覆盖模式。"""
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+    o = CrosshairOverlay()
+    o.enum_monitors()
+    if o.num_monitors() == 0:
+        print("错误: 未检测到显示器。")
+        return
+
+    o.monitor_idx = max(0, min(args.monitor - 1, o.num_monitors() - 1))
+    o.offset_x = args.offset_x
+    o.offset_y = args.offset_y
+    o.radius   = args.radius
+    o.thickness = args.width
+
+    cp = [int(x.strip()) for x in args.color.split(',')]
+    if len(cp) >= 3: o.r, o.g, o.b = cp[0:3]
+    if len(cp) >= 4: o.a = cp[3]
+
+    print("=" * 60)
+    print("  CrosshairX — 精确像素十字准星")
+    print("=" * 60)
+    print(f"  显示器: {o.num_monitors()} 个")
+    for i, m in enumerate(o.monitors):
+        r = m['rect']; w, h = r.right - r.left, r.bottom - r.top
+        tag = " [主]" if m['primary'] else ""
+        print(f"    [{i+1}]{tag} {w}x{h} @ ({r.left}, {r.top})")
+    r = o.monitor_rect()
+    print(f"\n  当前: [{o.monitor_idx+1}] {r.right-r.left}x{r.bottom-r.top}")
+    print(f"  偏移: ({o.offset_x:+d}, {o.offset_y:+d})")
+    print(f"  准星: 半径={o.radius}px, 线宽={o.thickness}px")
+    print(f"  颜色: RGBA({o.r},{o.g},{o.b},{o.a})")
+    print()
+    print("  方向键=移动 | Shift=加速 | M/1-9=切换显示器 | R=复位")
+    print("=" * 60)
+
+    try:
+        o.create_window()
+        o.install_hook()
+        print("  [OK] 准星已显示 (关闭控制面板退出)\n")
+
+        # 独立消息循环
+        msg = MSG()
+        while o.running:
+            ret = user32.GetMessageW(byref(msg), None, 0, 0)
+            if ret <= 0:
+                break
+            user32.TranslateMessage(byref(msg))
+            user32.DispatchMessageW(byref(msg))
+    except Exception as e:
+        print(f"\n错误: {e}")
+        import traceback; traceback.print_exc()
+    finally:
+        o.shutdown()
+    print("\n程序已退出。")
+
+
+def run_overlay_gui(args):
+    """带控制面板的覆盖模式。"""
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+    o = CrosshairOverlay()
+    o.enum_monitors()
+    if o.num_monitors() == 0:
+        print("错误: 未检测到显示器。")
+        return
+
+    o.monitor_idx = max(0, min(args.monitor - 1, o.num_monitors() - 1))
+    o.offset_x = args.offset_x
+    o.offset_y = args.offset_y
+    o.radius   = args.radius
+    o.thickness = args.width
+
+    cp = [int(x.strip()) for x in args.color.split(',')]
+    if len(cp) >= 3: o.r, o.g, o.b = cp[0:3]
+    if len(cp) >= 4: o.a = cp[3]
+
+    print("=" * 60)
+    print("  CrosshairX — 精确像素十字准星")
+    print("=" * 60)
+    print(f"  显示器: {o.num_monitors()} 个")
+    for i, m in enumerate(o.monitors):
+        r = m['rect']; w, h = r.right - r.left, r.bottom - r.top
+        tag = " [主]" if m['primary'] else ""
+        print(f"    [{i+1}]{tag} {w}x{h} @ ({r.left}, {r.top})")
+
+    try:
+        o.create_window()
+        o.install_hook()
+        print("  [OK] 准星已显示")
+        print("  [OK] 控制面板启动中...")
+        print("=" * 60)
+
+        panel = ControlPanel(o)
+        panel.start()  # tkinter 主循环（阻塞）
+
+    except Exception as e:
+        print(f"\n错误: {e}")
+        import traceback; traceback.print_exc()
+    finally:
+        o.shutdown()
+    print("\n程序已退出.")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DLL 注入  (完整 C 源码内联)
+# ══════════════════════════════════════════════════════════════════
+
+C_DLL_SOURCE = r"""/* crosshair_hook.c —— CrosshairX 注入 DLL */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0602
+#endif
+#include <windows.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <d2d1.h>
+
+#define MAX_SC 64
+#define SC_P    8
+#define SC_P1   22
+#define FAC_SC  10
+#define FAC2_SCH 15
+
+typedef HRESULT(STDMETHODCALLTYPE *PFn)(IDXGISwapChain*,UINT,UINT);
+typedef HRESULT(STDMETHODCALLTYPE *P1Fn)(IDXGISwapChain1*,UINT,UINT,const DXGI_PRESENT_PARAMETERS*);
+typedef HRESULT(STDMETHODCALLTYPE *CFn)(IDXGIFactory*,IUnknown*,DXGI_SWAP_CHAIN_DESC*,IDXGISwapChain**);
+typedef HRESULT(STDMETHODCALLTYPE *CHFn)(IDXGIFactory2*,IUnknown*,HWND,const DXGI_SWAP_CHAIN_DESC1*,const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*,IDXGIOutput*,IDXGISwapChain1**);
+
+static ID2D1Factory*g_d2d; static CRITICAL_SECTION g_cs;
+static int g_ox,g_oy,g_r=6,g_t=2;
+static float g_cr,g_cg,g_cb,g_ca=0.9f;
+static CFn g_osc; static CHFn g_osch; static IUnknown*g_ref; static int g_fh;
+typedef struct{IDXGISwapChain*sc;PFn o;P1Fn o1;}E;
+static E g_s[MAX_SC]={{0}}; static LONG g_n;
+
+static void**vt(void*o){return o?*(void***)o:NULL;}
+static void*vh(void**v,int i,void*f){
+  void*o=NULL;__try{o=v[i];if(o){DWORD p;VirtualProtect(&v[i],sizeof(void*),PAGE_EXECUTE_READWRITE,&p);v[i]=f;VirtualProtect(&v[i],sizeof(void*),p,&p);}}__except(1){}
+  return o;
+}
+
+static void rc(void){
+  char p[MAX_PATH];GetEnvironmentVariableA("TEMP",p,sizeof(p));
+  strcat_s(p,sizeof(p),"\\crosshair_hook.ini");
+  g_ox=GetPrivateProfileIntA("crosshair","offset_x",0,p);
+  g_oy=GetPrivateProfileIntA("crosshair","offset_y",0,p);
+  g_r=GetPrivateProfileIntA("crosshair","radius",6,p);
+  g_t=GetPrivateProfileIntA("crosshair","width",2,p);
+  char cs[32]={0};GetPrivateProfileStringA("crosshair","color","0,255,0,230",cs,sizeof(cs),p);
+  int r=0,gr=255,b=0,a=230;sscanf(cs,"%d,%d,%d,%d",&r,&gr,&b,&a);
+  g_cr=r/255.0f;g_cg=gr/255.0f;g_cb=b/255.0f;g_ca=a/255.0f;
+}
+
+static BOOL id2(void){
+  if(g_d2d)return 1;
+  HRESULT hr=D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,&IID_ID2D1Factory,NULL,(void**)&g_d2d);
+  if(FAILED(hr))hr=D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED,&IID_ID2D1Factory,NULL,(void**)&g_d2d);
+  return SUCCEEDED(hr);
+}
+
+static void dr(IDXGISwapChain*sc){
+  if(!g_d2d)return;
+  ID3D11Texture2D*bb=NULL;
+  HRESULT hr=IDXGISwapChain_GetBuffer(sc,0,&IID_ID3D11Texture2D,(void**)&bb);
+  if(SUCCEEDED(hr)&&bb){
+    IDXGISurface*s=NULL;
+    hr=ID3D11Texture2D_QueryInterface(bb,&IID_IDXGISurface,(void**)&s);
+    if(SUCCEEDED(hr)&&s){
+      D2D1_RENDER_TARGET_PROPERTIES rtp={0};
+      rtp.type=D2D1_RENDER_TARGET_TYPE_DEFAULT;
+      rtp.pixelFormat.format=DXGI_FORMAT_B8G8R8A8_UNORM;
+      rtp.pixelFormat.alphaMode=D2D1_ALPHA_MODE_PREMULTIPLIED;
+      rtp.dpiX=96.0f;rtp.dpiY=96.0f;
+      ID2D1RenderTarget*rt=NULL;
+      hr=ID2D1Factory_CreateDxgiSurfaceRenderTarget(g_d2d,s,&rtp,&rt);
+      if(SUCCEEDED(hr)&&rt){
+        D2D1_SIZE_F sz=ID2D1RenderTarget_GetSize(rt);
+        int cx=(int)(sz.width/2.0f)+g_ox,cy=(int)(sz.height/2.0f)+g_oy;
+        ID2D1SolidColorBrush*br=NULL;
+        D2D1_COLOR_F clr={g_cr,g_cg,g_cb,g_ca};
+        ID2D1RenderTarget_CreateSolidColorBrush(rt,clr,NULL,&br);
+        if(br){
+          ID2D1RenderTarget_BeginDraw(rt);
+          D2D1_RECT_F H={(FLOAT)(cx-g_r),(FLOAT)(cy-g_t/2),(FLOAT)(cx+g_r+1),(FLOAT)(cy-g_t/2+g_t)};
+          D2D1_RECT_F V={(FLOAT)(cx-g_t/2),(FLOAT)(cy-g_r),(FLOAT)(cx-g_t/2+g_t),(FLOAT)(cy+g_r+1)};
+          ID2D1RenderTarget_FillRectangle(rt,&H,(ID2D1Brush*)br);
+          ID2D1RenderTarget_FillRectangle(rt,&V,(ID2D1Brush*)br);
+          ID2D1RenderTarget_EndDraw(rt,NULL,NULL);br->lpVtbl->Release(br);
+        }
+        rt->lpVtbl->Release(rt);
+      }
+      IDXGISurface_Release(s);
+    }
+    ID3D11Texture2D_Release(bb);return;
+  }
+  IDXGISurface*s=NULL;
+  hr=IDXGISwapChain_GetBuffer(sc,0,&IID_IDXGISurface,(void**)&s);
+  if(SUCCEEDED(hr)&&s){
+    D2D1_RENDER_TARGET_PROPERTIES rtp={0};
+    rtp.type=D2D1_RENDER_TARGET_TYPE_DEFAULT;
+    rtp.pixelFormat.format=DXGI_FORMAT_B8G8R8A8_UNORM;
+    rtp.pixelFormat.alphaMode=D2D1_ALPHA_MODE_PREMULTIPLIED;
+    rtp.dpiX=96.0f;rtp.dpiY=96.0f;
+    ID2D1RenderTarget*rt=NULL;
+    hr=ID2D1Factory_CreateDxgiSurfaceRenderTarget(g_d2d,s,&rtp,&rt);
+    if(SUCCEEDED(hr)&&rt){
+      D2D1_SIZE_F sz=ID2D1RenderTarget_GetSize(rt);
+      int cx=(int)(sz.width/2.0f)+g_ox,cy=(int)(sz.height/2.0f)+g_oy;
+      ID2D1SolidColorBrush*br=NULL;
+      D2D1_COLOR_F clr={g_cr,g_cg,g_cb,g_ca};
+      ID2D1RenderTarget_CreateSolidColorBrush(rt,clr,NULL,&br);
+      if(br){
+        ID2D1RenderTarget_BeginDraw(rt);
+        D2D1_RECT_F H={(FLOAT)(cx-g_r),(FLOAT)(cy-g_t/2),(FLOAT)(cx+g_r+1),(FLOAT)(cy-g_t/2+g_t)};
+        D2D1_RECT_F V={(FLOAT)(cx-g_t/2),(FLOAT)(cy-g_r),(FLOAT)(cx-g_t/2+g_t),(FLOAT)(cy+g_r+1)};
+        ID2D1RenderTarget_FillRectangle(rt,&H,(ID2D1Brush*)br);
+        ID2D1RenderTarget_FillRectangle(rt,&V,(ID2D1Brush*)br);
+        ID2D1RenderTarget_EndDraw(rt,NULL,NULL);br->lpVtbl->Release(br);
+      }
+      rt->lpVtbl->Release(rt);
+    }
+    IDXGISurface_Release(s);
+  }
+}
+
+static HRESULT STDMETHODCALLTYPE hp(IDXGISwapChain*sc,UINT sy,UINT fl){
+  EnterCriticalSection(&g_cs);E*e=NULL;
+  for(int i=0;i<g_n;i++)if(g_s[i].sc==sc){e=&g_s[i];break;}
+  if(!e){LeaveCriticalSection(&g_cs);return E_NOTIMPL;}
+  PFn o=e->o;LeaveCriticalSection(&g_cs);dr(sc);return o(sc,sy,fl);
+}
+static HRESULT STDMETHODCALLTYPE hp1(IDXGISwapChain1*sc,UINT sy,UINT fl,const DXGI_PRESENT_PARAMETERS*p){
+  EnterCriticalSection(&g_cs);E*e=NULL;
+  for(int i=0;i<g_n;i++)if((IDXGISwapChain1*)g_s[i].sc==sc){e=&g_s[i];break;}
+  if(!e||!e->o1){LeaveCriticalSection(&g_cs);return E_NOTIMPL;}
+  P1Fn o=e->o1;LeaveCriticalSection(&g_cs);dr((IDXGISwapChain*)sc);return o(sc,sy,fl,p);
+}
+
+static void hs(IDXGISwapChain*sc){
+  if(!sc||g_n>=MAX_SC)return;
+  EnterCriticalSection(&g_cs);
+  for(int i=0;i<g_n;i++)if(g_s[i].sc==sc){LeaveCriticalSection(&g_cs);return;}
+  void**v=vt(sc);if(!v){LeaveCriticalSection(&g_cs);return;}
+  E*e=&g_s[g_n];e->sc=sc;e->o=(PFn)vh(v,SC_P,(void*)hp);
+  if(!e->o){LeaveCriticalSection(&g_cs);return;}
+  __try{e->o1=(P1Fn)vh(v,SC_P1,(void*)hp1);}__except(1){}
+  g_n++;LeaveCriticalSection(&g_cs);
+}
+
+static HRESULT STDMETHODCALLTYPE hc(IDXGIFactory*f,IUnknown*d,DXGI_SWAP_CHAIN_DESC*desc,IDXGISwapChain**pp){
+  HRESULT hr=g_osc(f,d,desc,pp);if(SUCCEEDED(hr)&&pp&&*pp)hs(*pp);return hr;
+}
+static HRESULT STDMETHODCALLTYPE hch(IDXGIFactory2*f,IUnknown*d,HWND h,const DXGI_SWAP_CHAIN_DESC1*desc,const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*fs,IDXGIOutput*ro,IDXGISwapChain1**pp){
+  HRESULT hr=g_osch(f,d,h,desc,fs,ro,pp);if(SUCCEEDED(hr)&&pp&&*pp)hs((IDXGISwapChain*)*pp);return hr;
+}
+
+static BOOL inst(void){
+  if(g_fh)return 1;
+  ID3D11Device*dev=NULL;ID3D11DeviceContext*ctx=NULL;D3D_FEATURE_LEVEL fl;
+  HRESULT hr=D3D11CreateDevice(NULL,D3D_DRIVER_TYPE_HARDWARE,NULL,0,NULL,0,D3D11_SDK_VERSION,&dev,&fl,&ctx);
+  if(FAILED(hr))hr=D3D11CreateDevice(NULL,D3D_DRIVER_TYPE_WARP,NULL,0,NULL,0,D3D11_SDK_VERSION,&dev,&fl,&ctx);
+  if(FAILED(hr)||!dev)return 0;
+  IDXGIDevice*dxd=NULL;hr=ID3D11Device_QueryInterface(dev,&IID_IDXGIDevice,(void**)&dxd);
+  if(SUCCEEDED(hr)&&dxd){IDXGIAdapter*adp=NULL;IDXGIDevice_GetAdapter(dxd,&adp);
+    if(adp){IDXGIFactory*fac=NULL;IDXGIAdapter_GetParent(adp,&IID_IDXGIFactory,(void**)&fac);
+      if(fac){void**v=vt(fac);
+        if(v){g_osc=(CFn)vh(v,FAC_SC,(void*)hc);
+          if(g_osc){IDXGIFactory2*f2=NULL;
+            if(SUCCEEDED(IDXGIFactory_QueryInterface(fac,&IID_IDXGIFactory2,(void**)&f2))&&f2){void**v2=vt(f2);
+              if(v2)g_osch=(CHFn)vh(v2,FAC2_SCH,(void*)hch);g_ref=(IUnknown*)f2;}
+            g_fh=1;}}
+        g_ref=g_ref?g_ref:(IUnknown*)fac;}IDXGIAdapter_Release(adp);}IDXGIDevice_Release(dxd);}
+  if(ctx)ID3D11DeviceContext_Release(ctx);if(dev)ID3D11Device_Release(dev);
+  return g_fh;
+}
+
+static DWORD WINAPI init(LPVOID p){Sleep(1000);rc();id2();
+  if(!inst()){for(int i=0;i<5;i++){Sleep(2000);if(inst())break;}}return 0;}
+
+BOOL APIENTRY DllMain(HMODULE m,DWORD r,LPVOID p){
+  switch(r){case DLL_PROCESS_ATTACH:DisableThreadLibraryCalls(m);
+    InitializeCriticalSection(&g_cs);CreateThread(NULL,0,init,NULL,0,NULL);break;
+  case DLL_PROCESS_DETACH:DeleteCriticalSection(&g_cs);
+    if(g_d2d){g_d2d->lpVtbl->Release(g_d2d);g_d2d=NULL;}break;}return 1;}
+__declspec(dllexport) int GetSwapChainCount(void){return(int)g_n;}
+"""
+
+
+def build_dll(msvc=False):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = os.path.join(script_dir, "crosshair_hook")
+    os.makedirs(out_dir, exist_ok=True)
+    c_path = os.path.join(out_dir, "crosshair_hook.c")
+    with open(c_path, 'w') as f:
+        f.write(C_DLL_SOURCE)
+    print(f"  [OK] C 源码已写入: {c_path}")
+
+    import subprocess
+    dll_path = os.path.join(out_dir, "crosshair_hook.dll")
+
+    if msvc:
+        cmd = f'cl /nologo /LD /O2 /MD /GS- "{c_path}" /Fe:"{dll_path}" /link d3d11.lib dxgi.lib d2d1.lib dwrite.lib user32.lib gdi32.lib'
+        result = subprocess.run(cmd, shell=True)
+    else:
+        result = None
+        for cc in ["x86_64-w64-mingw32-gcc", "gcc"]:
+            cmd = f'{cc} -shared -O2 -s -o "{dll_path}" "{c_path}" -ld3d11 -ldxgi -ld2d1 -ldwrite -lgdi32 -luser32 -m64 -static-libgcc -Wl,--subsystem,windows'
+            result = subprocess.run(cmd, shell=True)
+            if result.returncode == 0:
+                break
+
+    if result and result.returncode == 0 and os.path.exists(dll_path):
+        print(f"  [OK] DLL 编译成功 ({os.path.getsize(dll_path):,} bytes)")
+        return dll_path
+    else:
+        print("  [ERROR] 编译失败。请安装 MinGW-w64: https://www.mingw-w64.org/")
+        return None
+
+
+def inject(process_name, **kw):
+    import ctypes.wintypes as w
+    dll_path = kw.get('dll')
+    if not dll_path:
+        d = os.path.dirname(os.path.abspath(__file__))
+        dll_path = os.path.join(d, "crosshair_hook", "crosshair_hook.dll")
+    dll_path = os.path.abspath(dll_path)
+    if not os.path.exists(dll_path) and not kw.get('list_only'):
+        print(f"  [ERROR] DLL 未找到: {dll_path}")
+        print("  请先编译: python CrosshairX build-dll")
+        return
+
+    class PE32(Structure):
+        _fields_ = [('dwSize', w.DWORD),('cntUsage', w.DWORD),('th32ProcessID', w.DWORD),
+                    ('th32DefaultHeapID', POINTER(w.ULONG)),('th32ModuleID', w.DWORD),
+                    ('cntThreads', w.DWORD),('th32ParentProcessID', w.DWORD),
+                    ('pcPriClassBase', w.LONG),('dwFlags', w.DWORD),('szExeFile',ctypes.c_char*260)]
+
+    def by_name(n):
+        pids=[];snap=kernel32.CreateToolhelp32Snapshot(0x2,0)
+        if snap==-1:return pids
+        e=PE32();e.dwSize=sizeof(PE32)
+        if kernel32.Process32First(snap,byref(e)):
+            nl=n.lower()
+            while 1:
+                if nl in e.szExeFile.decode('utf-8','ignore').lower():pids.append(e.th32ProcessID)
+                if not kernel32.Process32Next(snap,byref(e)):break
+        kernel32.CloseHandle(snap);return pids
+
+    def by_win(t):
+        r=[]
+        @WINFUNCTYPE(w.BOOL,w.HWND,w.LPARAM)
+        def cb(hw,lp):
+            if user32.IsWindowVisible(hw):
+                n=user32.GetWindowTextLengthW(hw)
+                if n>0:
+                    b=ctypes.create_unicode_buffer(n+1);user32.GetWindowTextW(hw,b,n+1)
+                    if t.lower() in b.value.lower():
+                        pid=w.DWORD();user32.GetWindowThreadProcessId(hw,byref(pid));r.append(pid.value)
+            return 1
+        user32.EnumWindows(cb,0);return list(set(r))
+
+    pids=by_name(process_name)
+    if not pids:pids=by_win(process_name)
+    if not pids:print(f"\n  [ERROR] 未找到: {process_name}");return
+
+    print(f"\n找到 {len(pids)} 个进程:")
+    for pid in pids:
+        h=kernel32.OpenProcess(0x400|0x10,0,pid)
+        n="???"
+        if h:b=ctypes.create_string_buffer(260);ctypes.windll.psapi.GetModuleBaseNameA(h,None,b,260);kernel32.CloseHandle(h);n=b.value.decode('utf-8','ignore')
+        print(f"  PID: {pid:6d}  |  {n}")
+
+    if kw.get('list_only'):return
+
+    target= pids[0] if len(pids)==1 else None
+    if not target:
+        try:target=pids[int(input(f"\n选择 (1-{len(pids)}): ").strip())-1]
+        except:print("[ERROR] 取消");return
+
+    if not kw.get('no_confirm'):
+        print(f"\n{'='*60}\n!!! 反作弊警告 !!!\n{'='*60}")
+        print("DLL 注入会被反作弊系统 (EAC, BattlEye, Vanguard) 封禁。")
+        print("仅用于单机游戏!")
+        if input("\n确认? (yes): ").strip().lower()!='yes':print("已取消.");return
+
+    import tempfile
+    cfg=os.path.join(os.environ.get('TEMP',tempfile.gettempdir()),'crosshair_hook.ini')
+    with open(cfg,'w') as f:
+        f.write(f'[crosshair]\noffset_x={kw.get("offset_x",0)}\noffset_y={kw.get("offset_y",0)}\n')
+        f.write(f'radius={kw.get("radius",6)}\nwidth={kw.get("width",2)}\ncolor={kw.get("color","0,255,0,230")}\n')
+
+    hProc=kernel32.OpenProcess(0x2|0x400|0x8|0x20|0x10,0,target)
+    if not hProc:print("[ERROR] 无法打开进程 (需要管理员权限)");return
+
+    try:
+        dll_b=dll_path.encode('utf-16-le')+b'\x00\x00'
+        pR=kernel32.VirtualAllocEx(hProc,None,len(dll_b),0x1000|0x2000,0x04)
+        wr=w.SIZE_T();kernel32.WriteProcessMemory(hProc,pR,dll_b,len(dll_b)-2,byref(wr))
+        pLL=kernel32.GetProcAddress(kernel32.GetModuleHandleW("kernel32.dll"),"LoadLibraryW")
+        hT=kernel32.CreateRemoteThread(hProc,None,0,pLL,pR,0,None)
+        kernel32.WaitForSingleObject(hT,5000)
+        cd=w.DWORD();kernel32.GetExitCodeThread(hT,byref(cd));kernel32.CloseHandle(hT)
+        print(f"  [OK] DLL 注入成功! 基址: 0x{cd.value:016X}" if cd.value else "  [WARN] 注入可能失败")
+    except Exception as e:print(f"  [ERROR] {e}")
+    finally:kernel32.CloseHandle(hProc)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="CrosshairX — 精确像素绿色十字准星",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+操作 (默认模式):
+  方向键          移动准星 1 像素
+  Shift+方向键    移动准星 10 像素
+  R               重置偏移
+  M               循环切换显示器
+  1-9             直接跳转到指定显示器
+  退出            关闭控制面板窗口
+
+子命令:
+  inject <进程>   DLL 注入模式
+  build-dll       编译 DLL
+
+无子命令时默认启动 GUI 控制面板。
+用 --no-gui 可跳过 GUI 仅用热键。
+        """
+    )
+    parser.add_argument('-m', '--monitor', type=int, default=1)
+    parser.add_argument('-x', '--offset-x', type=int, default=0)
+    parser.add_argument('-y', '--offset-y', type=int, default=0)
+    parser.add_argument('-c', '--color', type=str, default='0,255,0,230')
+    parser.add_argument('-r', '--radius', type=int, default=6)
+    parser.add_argument('-w', '--width',  type=int, default=2)
+    parser.add_argument('--no-gui', action='store_true', help='不使用控制面板 (纯热键模式)')
+
+    sub = parser.add_subparsers(dest='cmd')
+
+    p_inj = sub.add_parser('inject', help='DLL 注入')
+    p_inj.add_argument('target');p_inj.add_argument('-x','--offset-x',type=int,default=0)
+    p_inj.add_argument('-y','--offset-y',type=int,default=0)
+    p_inj.add_argument('-c','--color',type=str,default='0,255,0,230')
+    p_inj.add_argument('-r','--radius',type=int,default=6)
+    p_inj.add_argument('-w','--width',type=int,default=2)
+    p_inj.add_argument('--dll');p_inj.add_argument('--list',action='store_true')
+    p_inj.add_argument('--no-confirm',action='store_true')
+
+    p_b = sub.add_parser('build-dll', help='编译 DLL')
+    p_b.add_argument('--msvc',action='store_true')
+
+    args = parser.parse_args()
+
+    if args.cmd == 'inject':
+        inject(args.target, offset_x=args.offset_x, offset_y=args.offset_y,
+               radius=args.radius, width=args.width, color=args.color,
+               dll=args.dll, list_only=args.list, no_confirm=args.no_confirm)
+    elif args.cmd == 'build-dll':
+        build_dll(args.msvc)
+    else:
+        if args.no_gui:
+            run_overlay_cli(args)
+        else:
+            run_overlay_gui(args)
+
+
+if __name__ == '__main__':
+    main()
